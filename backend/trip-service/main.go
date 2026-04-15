@@ -13,7 +13,7 @@ import (
 type Trip struct {
 	ID          string    `json:"id"`
 	PassengerID string    `json:"passenger_id"`
-	DriverID    string    `json:"driver_id"`
+	DriverID    *string   `json:"driver_id"`
 	FromLat     float64   `json:"from_lat"`
 	FromLng     float64   `json:"from_lng"`
 	ToLat       float64   `json:"to_lat"`
@@ -38,6 +38,7 @@ func main() {
 	r := gin.Default()
 
 	r.POST("/trips", createTrip)
+	r.GET("/trips", getAllPendingTrips)
 	r.GET("/trips/:id", getTrip)
 	r.PUT("/trips/:id/accept", acceptTrip)
 	r.PUT("/trips/:id/start", startTrip)
@@ -79,7 +80,7 @@ func getTrip(c *gin.Context) {
 	var trip Trip
 
 	err := db.QueryRow(`
-	SELECT id, passenger_id, COALESCE(driver_id, ''), from_lat, from_lng, to_lat, to_lng, status, price, created_at 
+		SELECT id, passenger_id, driver_id, from_lat, from_lng, to_lat, to_lng, status, price, created_at 
 		FROM trips WHERE id = $1`, id).Scan(
 		&trip.ID, &trip.PassengerID, &trip.DriverID, &trip.FromLat, &trip.FromLng,
 		&trip.ToLat, &trip.ToLng, &trip.Status, &trip.Price, &trip.CreatedAt)
@@ -94,6 +95,36 @@ func getTrip(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, trip)
+}
+
+func getAllPendingTrips(c *gin.Context) {
+	var trips []Trip
+	rows, err := db.Query(`
+		SELECT id, passenger_id, driver_id, from_lat, from_lng, to_lat, to_lng 
+		FROM trips WHERE status = 'pending'
+	`)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "No pending trips found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var trip Trip
+		if err := rows.Scan(&trip.ID, &trip.PassengerID, &trip.DriverID, &trip.FromLat, &trip.FromLng, &trip.ToLat, &trip.ToLng); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		trips = append(trips, trip)
+	}
+
+	c.JSON(http.StatusOK, trips)
+
 }
 
 func acceptTrip(c *gin.Context) {

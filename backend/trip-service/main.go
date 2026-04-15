@@ -1,59 +1,149 @@
-package tripservice
+package main
 
 import (
-	"context"
-	"fmt"
+	"database/sql"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
+	"github.com/gin-gonic/gin"
+	_ "github.com/lib/pq"
 )
 
+type Trip struct {
+	ID          string    `json:"id"`
+	PassengerID string    `json:"passenger_id"`
+	DriverID    string    `json:"driver_id"`
+	FromLat     float64   `json:"from_lat"`
+	FromLng     float64   `json:"from_lng"`
+	ToLat       float64   `json:"to_lat"`
+	ToLng       float64   `json:"to_lng"`
+	Status      string    `json:"status"` // pending, accepted, ongoing, done
+	Price       int       `json:"price"`  // всегда 500
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+var db *sql.DB
+
 func main() {
-	err := godotenv.Load()
+	var err error
+	db, err = sql.Open("postgres", "host=localhost port=5432 user=postgres password=passw0rd dbname=aimgo sslmode=disable")
+
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		log.Fatalf("Failed to connect to database: %v\n", err)
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080" // Default port if not specified
+	defer db.Close()
+
+	r := gin.Default()
+
+	r.POST("/trips", createTrip)
+	r.GET("/trips/:id", getTrip)
+	r.PUT("/trips/:id/accept", acceptTrip)
+	r.PUT("/trips/:id/start", startTrip)
+	r.PUT("/trips/:id/complete", doneTrip)
+
+	log.Println("Trip service is running on port 8005...")
+
+	r.Run(":8005")
+}
+
+func createTrip(c *gin.Context) {
+	var trip Trip
+
+	if err := c.ShouldBindJSON(&trip); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/trips", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Trip service is running!")
-	})
+	trip.Price = 500
+	trip.Status = "pending"
+	trip.CreatedAt = time.Now()
 
-	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
+	err := db.QueryRow(
+		`INSERT INTO trips (passenger_id, from_lat, from_lng, to_lat, to_lng, status, price) 
+		 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created_at`,
+		trip.PassengerID, trip.FromLat, trip.FromLng, trip.ToLat, trip.ToLng,
+		trip.Status, trip.Price).Scan(&trip.ID, &trip.CreatedAt)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
-	go func() {
-		log.Printf("Trip service is running on port %s\n", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Could not listen on port %s: %v\n", port, err)
+	c.JSON(http.StatusCreated, trip)
+}
+
+func getTrip(c *gin.Context) {
+	id := c.Param("id")
+	var trip Trip
+
+	err := db.QueryRow(`
+	SELECT id, passenger_id, COALESCE(driver_id, ''), from_lat, from_lng, to_lat, to_lng, status, price, created_at 
+		FROM trips WHERE id = $1`, id).Scan(
+		&trip.ID, &trip.PassengerID, &trip.DriverID, &trip.FromLat, &trip.FromLng,
+		&trip.ToLat, &trip.ToLng, &trip.Status, &trip.Price, &trip.CreatedAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Trip not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
-	}()
-
-	// Graceful shutdown
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	<-stop
-	log.Println("Shutting down trip service...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Could not gracefully shutdown the server: %v\n", err)
+		return
 	}
 
-	log.Println("Trip service stopped")
+	c.JSON(http.StatusOK, trip)
+}
+
+func acceptTrip(c *gin.Context) {
+	id := c.Param("id")
+	var body struct {
+		DriverID string `json:"driver_id"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, err := db.Exec(`UPDATE trips SET driver_id = $1, status = 'accepted' 
+		WHERE id = $2 AND status = 'pending'`, body.DriverID, id)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Trip accepted"})
+}
+
+func startTrip(c *gin.Context) {
+	id := c.Param("id")
+
+	_, err := db.Exec(`
+		UPDATE trips SET status = 'done' WHERE id = $1
+	`, id)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "done"})
+}
+
+func doneTrip(c *gin.Context) {
+	id := c.Param("id")
+
+	_, err := db.Exec(`
+		UPDATE trips SET status = 'done' WHERE id = $1
+	`, id)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "done"})
 }
